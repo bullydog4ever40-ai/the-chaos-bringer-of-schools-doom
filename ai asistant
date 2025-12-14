@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""
+mini_me.py
+
+Global Ctrl+A -> opens a small assistant window ("mini you").
+
+Requirements:
+  pip install openai pynput
+
+Notes:
+- Tkinter is in the Python stdlib for most installs. On some minimal Linux builds you may need
+  to install the system package for tkinter (e.g. python3-tk).
+- On macOS you must grant Accessibility permissions for global hotkeys.
+- On Linux some desktop environments may require extra permissions; pynput generally works, but
+  behaviour can vary.
+"""
+
+import os
+import threading
+import queue
+import time
+import tkinter as tk
+from tkinter import scrolledtext, simpledialog, messagebox
+
+# Optional OpenAI support (fallback to offline responder if not available)
+try:
+    import openai
+    OPENAI_AVAILABLE = True
+except Exception:
+    OPENAI_AVAILABLE = False
+
+try:
+    from pynput import keyboard
+    PYNPUT_AVAILABLE = True
+except Exception:
+    PYNPUT_AVAILABLE = False
+
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+if OPENAI_AVAILABLE and OPENAI_API_KEY:
+    openai.api_key = OPENAI_API_KEY
+
+# Simple offline fallback responder
+def offline_respond(prompt: str) -> str:
+    # Very small "mini you" behavior: mirror + tiny personality
+    prompt = prompt.strip()
+    if not prompt:
+        return "Say something and I'll chat back!"
+    lower = prompt.lower()
+    if "hello" in lower or "hi" in lower:
+        return "Hello! I'm your mini assistant. How can I help?"
+    if lower.endswith("?"):
+        return "That's an interesting question — I'm a mini assistant, so here's a short thought: " + \
+               "I think the answer depends on context. Could you give more details?"
+    # fallback: short summary style
+    if len(prompt) > 200:
+        return "Nice long message — tl;dr: " + prompt[:140].strip() + "..."
+    return f"You said: {prompt} — tell me more!"
+
+# Call OpenAI if available and key provided
+def openai_respond(prompt: str) -> str:
+    if not OPENAI_AVAILABLE or not OPENAI_API_KEY:
+        return offline_respond(prompt)
+    try:
+        # ChatCompletion usage; change model if you prefer
+        resp = openai.ChatCompletion.create(
+            model="gpt-3.5-turbo",
+            messages=[
+                {"role": "system", "content": "You are a helpful compact assistant called 'mini you'."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=300,
+            temperature=0.7,
+        )
+        text = resp.choices[0].message.get("content", "").strip()
+        if text:
+            return text
+        return "Sorry, I couldn't generate a response."
+    except Exception as e:
+        return f"[OpenAI error] {e}"
+
+# Choose responder based on availability
+def get_response(prompt: str) -> str:
+    if OPENAI_AVAILABLE and OPENAI_API_KEY:
+        return openai_respond(prompt)
+    else:
+        return offline_respond(prompt)
+
+# GUI window class
+class MiniMeWindow(tk.Toplevel):
+    def __init__(self, master, response_queue):
+        super().__init__(master)
+        self.response_queue = response_queue
+        self.title("mini you")
+        self.geometry("380x300")
+        self.resizable(False, False)
+
+        # Chat history (read-only)
+        self.chat = scrolledtext.ScrolledText(self, wrap=tk.WORD, height=12, state=tk.DISABLED)
+        self.chat.pack(padx=8, pady=(8, 4), fill=tk.BOTH, expand=True)
+
+        # Entry frame
+        frame = tk.Frame(self)
+        frame.pack(fill=tk.X, padx=8, pady=(0,8))
+
+        self.entry = tk.Entry(frame)
+        self.entry.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.entry.bind("<Return>", self._on_send)
+
+        send_btn = tk.Button(frame, text="Send", command=self._on_send)
+        send_btn.pack(side=tk.LEFT, padx=(6,0))
+
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        self.after(100, self._poll_response_queue)
+
+    def _append(self, who: str, text: str):
+        self.chat.config(state=tk.NORMAL)
+        self.chat.insert(tk.END, f"{who}: {text}\n\n")
+        self.chat.see(tk.END)
+        self.chat.config(state=tk.DISABLED)
+
+    def _on_send(self, event=None):
+        text = self.entry.get().strip()
+        if not text:
+            return
+        self._append("You", text)
+        self.entry.delete(0, tk.END)
+        # queue the job for worker thread
+        worker_submit(text)
+
+    def _poll_response_queue(self):
+        try:
+            while True:
+                resp = self.response_queue.get_nowait()
+                self._append("mini you", resp)
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_response_queue)
+
+    def _on_close(self):
+        self.destroy()
+
+# Threading and job queue for calling the responder
+job_queue = queue.Queue()
+response_queue = queue.Queue()
+
+def worker_thread():
+    while True:
+        prompt = job_queue.get()
+        if prompt is None:
+            break
+        try:
+            resp = get_response(prompt)
+        except Exception as e:
+            resp = f"[error] {e}"
+        response_queue.put(resp)
+        job_queue.task_done()
+
+def worker_submit(prompt: str):
+    job_queue.put(prompt)
+
+# Hotkey handling
+class HotkeyController:
+    def __init__(self, root):
+        self.root = root
+        self.window_refs = []
+        self.lock = threading.Lock()
+
+    def show_window(self):
+        # Schedule on mainloop thread
+        def _create():
+            # create a new window and focus entry
+            w = MiniMeWindow(self.root, response_queue)
+            self.window_refs.append(w)
+            try:
+                w.entry.focus_force()
+            except Exception:
+                pass
+        self.root.after(0, _create)
+
+# Install global hotkey using pynput
+def start_global_hotkey(hotkey_controller):
+    if not PYNPUT_AVAILABLE:
+        print("pynput not available. Global hotkey disabled. Launching GUI only.")
+        return
+
+    # Callback invoked from listener thread -- use root.after to schedule GUI creation
+    def on_activate():
+        hotkey_controller.show_window()
+
+    # Map string to callback
+    hotkeys = { "<ctrl>+a": on_activate }
+
+    # Use GlobalHotKeys; it runs its own loop in a thread
+    try:
+        with keyboard.GlobalHotKeys(hotkeys) as h:
+            h.join()
+    except Exception as e:
+        # If GlobalHotKeys fails for platform reasons, fallback to a very simple listener
+        print(f"Hotkey listener error: {e}")
+
+def main():
+    # Start worker thread
+    t = threading.Thread(target=worker_thread, daemon=True)
+    t.start()
+
+    # Create hidden main root (tk must run on main thread)
+    root = tk.Tk()
+    root.withdraw()  # keep main window hidden
+
+    hk = HotkeyController(root)
+
+    # Start pynput hotkey listener in a background thread so tk mainloop isn't blocked
+    if PYNPUT_AVAILABLE:
+        t_hotkey = threading.Thread(target=start_global_hotkey, args=(hk,), daemon=True)
+        t_hotkey.start()
+    else:
+        # If pynput not installed, show an initial window and instruct user
+        root.after(0, lambda: messagebox.showinfo("mini you", "pynput not installed or available. "
+                                    "Install pynput to enable global Ctrl+A hotkey.\n\n"
+                                    "Alternatively, run the script and call hk.show_window() inside code."))
+
+    # Optionally create a small launcher window that reminds user (hidden by default)
+    # Keep mainloop running so hotkey can schedule windows
+    try:
+        root.mainloop()
+    except KeyboardInterrupt:
+        pass
+    # Shutdown worker
+    job_queue.put(None)
+    t.join(timeout=1)
+
+if __name__ == "__main__":
+    if not PYNPUT_AVAILABLE:
+        print("Warning: pynput is not installed or could not be imported.")
+        print("Install with: pip install pynput")
+    if OPENAI_AVAILABLE and not OPENAI_API_KEY:
+        print("OpenAI package found but OPENAI_API_KEY is not set; falling back to offline responder.")
+    elif not OPENAI_AVAILABLE and OPENAI_API_KEY:
+        print("OPENAI_API_KEY is set but 'openai' package not installed. Install with: pip install openai")
+    elif OPENAI_AVAILABLE and OPENAI_API_KEY:
+        print("OpenAI enabled. Using API key from environment variable.")
+    print("Starting mini-me. Press Ctrl+A to open a mini assistant window.")
+    print("Press Ctrl+C in this terminal to exit.")
+    main()
